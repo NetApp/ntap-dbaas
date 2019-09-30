@@ -1,0 +1,666 @@
+#! /usr/bin/python
+###########################################################################
+# (c) 2019 NetApp Inc. (NetApp), All Rights Reserved
+#
+# NetApp disclaims all warranties, excepting NetApp shall provide
+# support of unmodified software pursuant to a valid, separate,
+# purchased support agreement.  No distribution or modification of
+# this software is permitted by NetApp, except under separate
+# written agreement, which may be withheld at NetApp's sole
+# discretion.
+#
+# THIS SOFTWARE IS PROVIDED BY NETAPP "AS IS" AND ANY EXPRESS OR
+# IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+# WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+# ARE DISCLAIMED. IN NO EVENT SHALL NETAPP BE LIABLE FOR ANY DIRECT,
+# INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+# (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+# SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
+# HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT,
+# STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+# ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED
+# OF THE POSSIBILITY OF SUCH DAMAGE.
+#
+# Created by Jeffrey Steiner, jfs@netapp.com
+#
+###########################################################################
+
+###########################################################################
+#
+# This script is essentially just a wrapped for the kubectl command. It is
+# easily customized as needed.
+#
+# There is a hidden option of --nogo which causes the script to print the
+# specific kubectl command, rather than actually executing it. This can be
+# used to debug possible extensions of the wrapper and then run the kubectl
+# command to complete the operation. This allows the user to view the
+# specific input and output of each step
+#
+###########################################################################
+
+import sys
+sys.path.append(sys.path[0] + "/NTAPlib")
+import os
+import getopt
+import userio
+import json
+from doprocess import doprocess as doprocess
+import fileio
+import random
+import time
+
+
+def printusageanddie():
+    userio.message("usage: dbaas create      (unique identifier for DBaaS service)")
+    userio.message("                          --sid (database sid)")
+    userio.message("                          --pdb (PDB name > = 12.2.0.1 only)")
+    userio.message("                          --version [12.2.0.1|12.1.0.2|11.2.0.4]")
+    userio.message("                          --password (oracle password)")
+    userio.message("                          --trace")
+    userio.message("")
+    userio.message("usage: dbaas provision  (unique identifier for DBaaS service")
+    userio.message("                         --sid (database sid)")
+    userio.message("                         --pdb (PDB name > = 12.2.0.1 only)")
+    userio.message("                         --from DBaaS uuid of source")
+    userio.message("                         --password (oracle password)")
+    userio.message("                         --trace")
+    userio.message("")
+    userio.message("usage: dbaas clone      (unique identifier for DBaaS service)")
+    userio.message("                         --sid (database sid)")
+    userio.message("                         --pdb (PDB name > = 12.2.0.1 only)")
+    userio.message("                         --from DBaaS uuid of source")
+    userio.message("                         --password (oracle password)")
+    userio.message("                         --trace")
+    userio.message("")
+    userio.message("usage: dbaas rm         (unique identifier for DBaaS service")
+    userio.message("")
+    userio.message("usage: dbaas mktemplate (unique identifier for DBaaS service)")
+    userio.message("")
+    userio.message("usage: dbaas rmtemplate (unique identifier for DBaaS service)")
+    userio.message("")
+    userio.message("usage: dbaas show       (unique identifier for DBaaS service)")
+    userio.message("")
+    userio.message("usage: dbaas trace      (unique identifier for DBaaS service)")
+    userio.message("")
+    userio.message("usage: dbaas cli        (unique identifier for DBaaS service)")
+    userio.message("")
+    sys.exit(1)
+
+
+def getfield(jsondict, fields):
+    nextiter = jsondict
+    for item in fields:
+        if item not in nextiter.keys():
+            return(None)
+        else:
+            nextiter = nextiter[item]
+    return(nextiter)
+
+
+def pvcstring(objtype, **kwargs):
+    pvcname = kwargs['name']
+    uuid = kwargs['uuid']
+    version = kwargs['version']
+    size = kwargs['size']
+    sspolicy = kwargs['sspolicy']
+    db = kwargs['db']
+    pvc = []
+    pvc.append('kind: PersistentVolumeClaim')
+    pvc.append('apiVersion: v1')
+    pvc.append('metadata:')
+    pvc.append('  name: ' + pvcname.lower())
+    pvc.append('  annotations:')
+    pvc.append('    trident.netapp.io/reclaimPolicy: "Delete"')
+    pvc.append('    trident.netapp.io/snapshotPolicy: "' + sspolicy + '"')
+    pvc.append('    trident.netapp.io/protocol: "file"')
+    pvc.append('    trident.netapp.io/snapshotDirectory: "true"')
+    pvc.append('    trident.netapp.io/unixPermissions: "---rwxrwxrwx"')
+    pvc.append('    trident.netapp.io/size: "' + str(size) + 'Gi"')
+    if 'sourcevol' in kwargs.keys() and kwargs['sourcevol'] is not None:
+        pvc.append('    trident.netapp.io/cloneFromPVC: "' + kwargs['sourcevol'] + '"')
+    if 'splitclone' in kwargs.keys() and kwargs['splitclone']:
+        pvc.append('    trident.netapp.io/splitOnClone: "true"')
+    pvc.append('    ntap-dbaas-managed: "True"')
+    pvc.append('    ntap-dbaas-version: "' + version + '"')
+    pvc.append('    ntap-dbaas-uuid: "' + uuid + '"')
+    pvc.append('    ntap-dbaas-db: "' + db + '"')
+    pvc.append('    ntap-dbaas-type: "' + objtype + '"')
+    pvc.append('    ntap-dbaas-sid: "' + kwargs['sid'] + '"')
+    if kwargs['pdb']:
+        pvc.append('    ntap-dbaas-pdb: "' + kwargs['pdb'] + '"')
+    pvc.append('spec:')
+    pvc.append('  accessModes:')
+    pvc.append('     - ReadWriteOnce')
+    pvc.append('  resources:')
+    pvc.append('     requests:')
+    pvc.append('        storage: ' + str(size) + 'Gi')
+    pvc.append('  storageClassName: ntap-dbaas')
+    return("\n".join(pvc) + "\n")
+
+
+def deploymentstring(objtype, **kwargs):
+    rcname = kwargs['name']
+    uuid = kwargs['uuid']
+    version = kwargs['version']
+    sid = kwargs['sid']
+    password = kwargs['password']
+    db = kwargs['db']
+    args = ['--sid', sid]
+    if 'pdb' in kwargs.keys():
+        args.append('--pdb')
+        args.append(kwargs['pdb'])
+    args.append('--version')
+    args.append(version)
+    args.append(' --password')
+    args.append(password)
+    if kwargs['spin']:
+        args.append('--spin')
+    argstring = '", "'.join(args)
+    deploy = []
+    deploy.append('kind: Deployment')
+    deploy.append('apiVersion: apps/v1')
+    deploy.append('metadata:')
+    deploy.append('  name: ' + containername.lower())
+    deploy.append('  annotations:')
+    deploy.append('    ntap-dbaas-managed: "True"')
+    deploy.append('    ntap-dbaas-uuid: "' + uuid + '"')
+    deploy.append('    ntap-dbaas-db: "' + db + '"')
+    deploy.append('    ntap-dbaas-type: "HAservice"')
+    deploy.append('spec:')
+    deploy.append('  replicas: 1')
+    deploy.append('  selector:')
+    deploy.append('    matchLabels:')
+    deploy.append('      ntap-dbaas-HA: "Y"')
+    deploy.append('  template:')
+    deploy.append('    metadata:')
+    deploy.append('      labels:')
+    deploy.append('        ntap-dbaas-HA: "Y"')
+    deploy.append('      annotations:')
+    deploy.append('        ntap-dbaas-managed: "True"')
+    deploy.append('        ntap-dbaas-version: "' + version + '"')
+    deploy.append('        ntap-dbaas-uuid: "' + uuid + '"')
+    deploy.append('        ntap-dbaas-db: "' + db + '"')
+    deploy.append('        ntap-dbaas-type: "container"')
+    deploy.append('        ntap-dbaas-sid: "' + kwargs['sid'] + '"')
+    if kwargs['pdb']:
+        deploy.append('        ntap-dbaas-pdb: "' + kwargs['pdb'] + '"')
+    deploy.append('    spec:')
+    deploy.append('      volumes:')
+    deploy.append('        - name: datafiles')
+    deploy.append('          persistentVolumeClaim:')
+    deploy.append('            claimName: ' + containername + '-dbf')
+    deploy.append('        - name: logs')
+    deploy.append('          persistentVolumeClaim:')
+    deploy.append('            claimName: ' + containername + '-log')
+    deploy.append('      containers:')
+    deploy.append('        - name: ' + containername)
+    deploy.append('          image: database:' + version + '-ntap')
+    deploy.append('          command: ["/orabin/NTAP.init"]')
+    deploy.append('          args: ["' + argstring + '"]')
+    deploy.append('          ports:')
+    deploy.append('            - containerPort: 1521')
+    deploy.append('              name: "sqlnet"')
+    deploy.append('            - containerPort: 2022')
+    deploy.append('              name: "oraclessh"')
+    deploy.append('          volumeMounts:')
+    deploy.append('            - mountPath: "/oradata"')
+    deploy.append('              name: datafiles')
+    deploy.append('            - mountPath: "/logs"')
+    deploy.append('              name: logs')
+    return("\n".join(deploy) + "\n")
+
+
+def getDBaaS(**kwargs):
+    objtype = kwargs['objtype']
+    if objtype == 'container':
+        getobj = 'pod'
+    elif objtype == 'HAservice':
+        getobj = 'Deployment'
+    elif objtype == 'dbf' or objtype == 'log':
+        getobj = 'pvc'
+    else:
+        userio.fail("Invalid objtype passed to getDBaaS")
+    if 'uuid' in kwargs.keys():
+        uuid = kwargs['uuid']
+    else:
+        uuid = None
+    cmd = "kubectl get " + getobj + " -o json"
+    out = doprocess(cmd, env={'KUBECONFIG': '/etc/kubernetes/admin.conf'})
+    if out['RESULT'] > 0:
+        return({'RESULT': 1, 'STDOUT': [], 'STDERR': ["Unable to enumerate " + getobj + " objects"]})
+    try:
+        jsonout = json.loads('\n'.join(out['STDOUT']))
+    except ValueError:
+        return({'RESULT': 1, 'STDOUT': [], 'STDERR': ["Unable to parse output of " + cmd]})
+    objs = {}
+    namelist = []
+    for item in jsonout['items']:
+        if getfield(item, ['metadata', 'annotations', 'ntap-dbaas-managed']) == 'True':
+            name = item['metadata']['name']
+            namelist.append(name)
+            if uuid is None or uuid == getfield(item, ['metadata', 'annotations', 'ntap-dbaas-uuid']):
+                objuuid = item['metadata']['annotations']['ntap-dbaas-uuid']
+                if uuid is not None and objuuid in objs:
+                    userio.fail("Detected duplicate objects with uuid " + uuid)
+                if getfield(item, ['metadata', 'annotations', 'ntap-dbaas-type']) == objtype:
+                    objs[objuuid] = {'name': name}
+                    objkeys = item['metadata']['annotations'].keys()
+                    for key in objkeys:
+                        if key.startswith('ntap-dbaas-'):
+                            objs[objuuid][key[11:]] = item['metadata']['annotations'][key]
+                    if objtype == 'container':
+                        objs[objuuid]['status'] = getfield(item, ['status', 'phase'])
+                        objs[objuuid]['IP'] = getfield(item, ['status', 'podIP'])
+                        objs[objuuid]['node'] = getfield(item, ['spec', 'nodeName'])
+                        objs[objuuid]['HA'] = getfield(item, ['metadata', 'labels', 'ntap-dbaas-HA'])
+                    elif objtype == 'pvc':
+                        objs[objuuid]['status'] = getfield(item, ['status'], ['phase'])
+                    elif objtype == 'HAservice':
+                        if getfield(item, ['status', 'availableReplicas']) == 1:
+                            objs[objuuid]['status'] = "Healthy"
+                        else:
+                            objs[objuuid]['status'] = "Unknown"
+
+    return({'RESULT': 0, 'OBJS': objs, 'ALLNAMES': namelist})
+
+
+def gettempfile(filename):
+    randomtoken = ''.join(random.choice('0123456789abcdefg') for i in range(16))
+    if not fileio.forcemkdir(tempdir, mode=700, quiet=True):
+        return(None)
+    else:
+        return(os.path.join(tempdir, randomtoken + "." + filename))
+
+
+def traceDBaaS(containername):
+    podname = None
+    status = None
+    retries = 0
+    while podname is None or not status == 'Running':
+        out = getDBaaS(objtype='container')
+        if out['RESULT'] > 0:
+            userio.fail("Failed to enumerate running containers")
+        elif containername in out['OBJS'].keys():
+            podname = out['OBJS'][containername]['name']
+            status = out['OBJS'][containername]['status']
+        else:
+            time.sleep(tracesleeptime)
+            retries += 1
+            if retries >= maxtraceretries:
+                userio.fail("Max retries exceeded, unable to get logs for " + containername)
+    out = doprocess('kubectl logs -f ' + podname, printstdout=True, trapsignals=True, env={'KUBECONFIG': '/etc/kubernetes/admin.conf'})
+    if out['RESULT'] > 0:
+        userio.fail(['Failed to read logs from container ' + podname] + out['STDERR'])
+
+
+def createDBaaS(objtype, **kwargs):
+    if objtype == 'HAservice':
+        yamltext = deploymentstring(objtype, **kwargs)
+    elif objtype == 'dbf' or objtype == 'log':
+        yamltext = pvcstring(objtype, **kwargs)
+    else:
+        userio.fail("Invalid objtype passed to createDBaaS")
+    yamlpath = gettempfile(kwargs['name'])
+    tempfiles.append(yamlpath)
+    if go:
+        open(yamlpath, 'w').write(yamltext)
+        out = doprocess('kubectl create -f ' + yamlpath, env={'KUBECONFIG': '/etc/kubernetes/admin.conf'})
+        if out['RESULT'] > 0:
+            userio.fail(['Failed to create ' + objdesc[objtype] + ' ' + uuid] + out['STDERR'])
+        else:
+            userio.message("Created " + objdesc[objtype] + " " + uuid)
+    else:
+        userio.message("cat << EOF | kubectl create -f -")
+        userio.message(yamltext)
+        userio.message('EOF')
+
+
+def rmDBaaS(name, **kwargs):
+    objtype = kwargs['objtype']
+    if objtype == 'HAservice':
+        rmobj = 'Deployment'
+    elif objtype == 'container':
+        rmobj = 'pod'
+    elif objtype == 'dbf' or objtype == 'log':
+        rmobj = 'pvc'
+    else:
+        userio.fail("Invalid objtype passed to rmDBaaS")
+    if go:
+        out = doprocess('kubectl delete ' + rmobj + ' ' + name, env={'KUBECONFIG': '/etc/kubernetes/admin.conf'})
+        if out['RESULT'] > 0:
+            userio.fail(['Failed to delete ' + objdesc[objtype] + ' ' + name] + out['STDERR'])
+        else:
+            userio.message("Deleted " + objdesc[objtype] + " " + name)
+        terminated = False
+        retries = 0
+        while not terminated:
+            cmd = "kubectl get " + rmobj + " " + name + " --no-headers"
+            out = doprocess(cmd, env={'KUBECONFIG': '/etc/kubernetes/admin.conf'})
+            if out['RESULT'] > 0:
+                if 'NotFound' in out['STDERR'][0] or 'No resources found' in out['STDERR'][0]:
+                    terminated = True
+                else:
+                    userio.fail("Failed to parse output of '" + cmd + "'")
+            else:
+                fields = out['STDOUT'][0].split()
+                if len(fields) < 3 or not fields[0] == name:
+                    userio.fail("Failed to parse output of '" + cmd + "'")
+                else:
+                    userio.message(name + " has status '" + fields[2] + "'")
+                    time.sleep(deletesleeptime)
+                    retries += 1
+                    if retries >= maxdeleteretries:
+                        userio.fail("Max retries exceeded, unable to remove " + objtype + " " + name)
+    else:
+        userio.message("kubectl delete " + rmobj + ' ' + name)
+
+
+knownmodes = ['create', 'clone', 'rm', 'provision', 'show', 'mktemplate', 'rmtemplate', 'cli', 'trace']
+validoptions = {'create': ['sid=', 'pdb=', 'version=', 'password=', 'nogo', 'nocleanup', 'trace', 'spin']}
+validoptions['clone'] = ['sid=', 'pdb=', 'from=', 'password=', 'nogo', 'nocleanup', 'trace', 'spin']
+validoptions['rm'] = ['nogo', 'nocleanup']
+validoptions['mktemplate'] = ['nogo', 'nocleanup']
+validoptions['rmtemplate'] = ['nogo', 'nocleanup']
+validoptions['provision'] = ['sid=', 'pdb=', 'from=', 'password=', 'nogo', 'nocleanup', 'trace', 'spin']
+validoptions['show'] = []
+validoptions['cli'] = []
+validoptions['trace'] = []
+requiredoptions = {'create': ['sid=', 'version=']}
+requiredoptions['clone'] = ['from']
+requiredoptions['rm'] = []
+requiredoptions['mktemplate'] = []
+requiredoptions['rmtemplate'] = []
+requiredoptions['show'] = []
+requiredoptions['cli'] = []
+requiredoptions['trace'] = []
+requiredoptions['provision'] = ['from']
+knownversions = ['12.2.0.1', '12.1.0.2', '11.2.0.4']
+mode = None
+clonesource = None
+oraclesid = None
+oraclepdb = None
+pdbmode = None
+version = None
+uuid = None
+password = 'oracle'
+go = True
+cleanup = True
+tempfiles = []
+trace = False
+dbfvolsize = 8
+dbfsnapshotpolicy = 'docker-datafiles'
+logvolsize = 4
+logsnapshotpolicy = 'docker-logs'
+objdesc = {'HAservice': 'High Availability Service', 'container': 'container', 'dbf': 'datafile persistent volume claim', 'log': 'logfile persistent volume claim'}
+maxdeleteretries = 30
+deletesleeptime = 2
+maxtraceretries = 10
+tracesleeptime = 1
+splitclone = False
+allobjkeys = ['name', 'type', 'status', 'db', 'version', 'sid', 'pdb', 'HA', 'node', 'IP']
+spin = False
+
+
+tempdir = '/tmp/kube.ntap-dbaas'
+
+if len(sys.argv) < 2 or sys.argv[1] not in knownmodes:
+    printusageanddie()
+
+mode = sys.argv[1]
+if len(sys.argv) < 3:
+    if not mode == 'show':
+        printusageanddie()
+else:
+    uuid = sys.argv[2]
+    if sys.argv[2][:2] == '--':
+        userio.fail("The second argument should be a uuid, found argument " + sys.argv[2] + " instead")
+
+knownoptions = validoptions[mode]
+
+try:
+    options, args = getopt.getopt(sys.argv[3:], '', knownoptions)
+except getopt.GetoptError as e:
+    userio.fail(str(e))
+
+passedoptions = []
+for o, a in options:
+    passedoptions.append(o)
+    if o == '--sid':
+        oraclesid = a
+    elif o == '--pdb':
+        oraclepdb = a
+        pdbmode = True
+    elif o == '--version':
+        version = a
+    elif o == '--password':
+        password = a
+    elif o == '--from':
+        clonesource = a
+    elif o == '--nogo':
+        go = False
+    elif o == '--nocleanup':
+        cleanup = False
+    elif o == '--trace':
+        trace = True
+    elif o == '--spin':
+        spin = True
+
+if mode == 'provision':
+    splitclone = True
+
+if pdbmode and oraclesid == oraclepdb:
+    userio.fail("PDB name cannot be the same as the Oracle SID")
+
+for item in requiredoptions[mode]:
+    reformatted = '--' + item.replace('=', '')
+    if reformatted not in passedoptions:
+        userio.fail(reformatted + " is required with dbaas " + mode)
+
+if mode == 'create':
+    fields = map(int, version.split('.'))
+    if fields[0] >= 12 and fields[1] >= 2 and oraclepdb is None:
+        userio.fail("PDB name required for > = 12.2.0.1")
+
+if mode == 'create' or mode == 'clone' or mode == 'provision':
+    dbf2clone = None
+    log2clone = None
+
+    if clonesource is not None:
+        alldbfpvcs = getDBaaS(objtype='dbf')
+        alllogpvcs = getDBaaS(objtype='log')
+        if clonesource not in alldbfpvcs['OBJS'].keys():
+            userio.fail("Unable to find resource " + clonesource)
+        dbf2clone = alldbfpvcs['OBJS'][clonesource]['name']
+        log2clone = alllogpvcs['OBJS'][clonesource]['name']
+        version = alldbfpvcs['OBJS'][clonesource]['version']
+        if oraclesid is None:
+            oraclesid = alldbfpvcs['OBJS'][clonesource]['sid']
+        if alldbfpvcs['OBJS'][clonesource]['pdb'] is not None:
+            oraclepdb = alldbfpvcs['OBJS'][clonesource]['pdb']
+
+    if oraclepdb:
+        containername = '-'.join([uuid, oraclesid, oraclepdb]).lower()
+        dbfpvcname = '-'.join([uuid, oraclesid, oraclepdb, 'dbf']).lower()
+        logpvcname = '-'.join([uuid, oraclesid, oraclepdb, 'log']).lower()
+    else:
+        containername = '-'.join([uuid, oraclesid]).lower()
+        dbfpvcname = '-'.join([uuid, oraclesid, 'dbf']).lower()
+        logpvcname = '-'.join([uuid, oraclesid, 'log']).lower()
+
+    conflictlist = []
+    allhaservices = getDBaaS(objtype='HAservice')
+    if containername in allhaservices['ALLNAMES']:
+        conflictlist.append("HA Container " + containername + " already exists")
+    allpods = getDBaaS(objtype='container')
+    if containername in allpods['ALLNAMES']:
+        conflictlist.append("Container " + containername + " already exists")
+    for item in allhaservices['OBJS'].keys():
+        if allhaservices['OBJS'][item]['name'] == containername:
+            conflictlist.append("Container " + containername + " already has uuid " + uuid)
+    allpvcs = getDBaaS(objtype='dbf')
+    if dbfpvcname in allpvcs['ALLNAMES']:
+        conflictlist.append("Persistent volume claim " + dbfpvcname + " already exists")
+    allpvcs = getDBaaS(objtype='log')
+    if logpvcname in allpvcs['ALLNAMES']:
+        conflictlist.append("Persistent volume claim " + logpvcname + " already exists")
+    for item in allpvcs['OBJS'].keys():
+        if allpvcs['OBJS'][item]['name'] == dbfpvcname:
+            conflictlist.append("Persistent volume claim " + dbfpvcname + " already has uuid " + uuid)
+        if allpvcs['OBJS'][item]['name'] == logpvcname:
+            conflictlist.append("Persistent volume claim " + logpvcname + " already has uuid " + uuid)
+
+    if mode == 'provision' or mode == 'clone':
+        if dbf2clone is None or log2clone is None:
+            userio.fail("Unable to find source volumes for uuid " + clonesource)
+
+    if len(conflictlist) > 0:
+        userio.fail(sorted(set(conflictlist)))
+
+    createDBaaS('dbf', name=dbfpvcname, db='oracle', splitclone=splitclone,
+                sourcevol=dbf2clone, uuid=uuid, version=version, size=dbfvolsize,
+                sspolicy=dbfsnapshotpolicy, sid=oraclesid, pdb=oraclepdb)
+    createDBaaS('log', name=logpvcname, db='oracle', splitclone=splitclone,
+                sourcevol=log2clone, uuid=uuid, version=version, size=logvolsize,
+                sspolicy=logsnapshotpolicy, sid=oraclesid, pdb=oraclepdb)
+    createDBaaS('HAservice', name=containername, db='oracle', uuid=uuid,
+                version=version, sid=oraclesid, pdb=oraclepdb, password=password,
+                spin=spin)
+
+    if trace and go:
+        traceDBaaS(uuid)
+
+if mode == 'trace':
+    allcontainers = getDBaaS(objtype='container', uuid=uuid)
+    if len(allcontainers['OBJS']) < 1:
+        userio.fail("DBaaS container with uuid " + uuid + " not found")
+    containername = allcontainers['OBJS'][uuid]['name']
+    traceDBaaS(uuid)
+
+
+if mode == 'mktemplate':
+    missing = []
+    allhaservices = getDBaaS(objtype='HAservice')
+    allcontainers = getDBaaS(objtype='container')
+    if uuid not in allhaservices['OBJS'].keys():
+        missing.append("Unable to find HAservice with uuid " + uuid)
+    dbfpvcs = getDBaaS(objtype='dbf')
+    if uuid not in dbfpvcs['OBJS'].keys():
+        missing.append("Unable to find " + objdesc['dbf'] + " with uuid " + uuid)
+    logpvcs = getDBaaS(objtype='log')
+    if uuid not in logpvcs['OBJS'].keys():
+        missing.append("Unable to find " + objdesc['log'] + " with uuid " + uuid)
+    if len(missing) > 0:
+        userio.fail(missing)
+
+    rmDBaaS(allhaservices['OBJS'][uuid]['name'], objtype='HAservice')
+    if uuid in allcontainers['OBJS'].keys():
+        rmDBaaS(allcontainers['OBJS'][uuid]['name'], objtype='container')
+
+if mode == 'rmtemplate':
+    missing = []
+    dbfpvcs = getDBaaS(objtype='dbf')
+    if uuid not in dbfpvcs['OBJS'].keys():
+        missing.append("Unable to find " + objdesc['dbf'] + " with uuid " + uuid)
+    logpvcs = getDBaaS(objtype='log')
+    if uuid not in logpvcs['OBJS'].keys():
+        missing.append("Unable to find " + objdesc['log'] + " with uuid " + uuid)
+    if len(missing) > 0:
+        userio.fail(missing)
+
+    rmDBaaS(dbfpvcs['OBJS'][uuid]['name'], objtype='dbf')
+    rmDBaaS(logpvcs['OBJS'][uuid]['name'], objtype='log')
+
+if mode == 'rm':
+    missing = []
+    allhaservices = getDBaaS(objtype='HAservice')
+    allcontainers = getDBaaS(objtype='container')
+    if uuid not in allhaservices['OBJS'].keys() and uuid not in allcontainers['OBJS'].keys():
+        missing.append("Unable to find container with uuid " + uuid)
+    dbfpvcs = getDBaaS(objtype='dbf')
+    if uuid not in dbfpvcs['OBJS'].keys():
+        missing.append("Unable to find " + objdesc['dbf'] + " with uuid " + uuid)
+    logpvcs = getDBaaS(objtype='log')
+    if uuid not in logpvcs['OBJS'].keys():
+        missing.append("Unable to find " + objdesc['log'] + " with uuid " + uuid)
+    if len(missing) > 0:
+        userio.fail(missing)
+
+    if uuid in allhaservices['OBJS'].keys():
+        rmDBaaS(allhaservices['OBJS'][uuid]['name'], objtype='HAservice')
+    if uuid in allcontainers['OBJS'].keys():
+        rmDBaaS(allcontainers['OBJS'][uuid]['name'], objtype='container')
+    rmDBaaS(dbfpvcs['OBJS'][uuid]['name'], objtype='dbf')
+    rmDBaaS(logpvcs['OBJS'][uuid]['name'], objtype='log')
+
+if mode == 'show':
+    grid = []
+    allhaservices = getDBaaS(objtype='HAservice')
+    if allhaservices['RESULT']:
+        userio.fail("Unable to enumerate HA containers")
+    allcontainers = getDBaaS(objtype='container')
+    if allcontainers['RESULT']:
+        userio.fail("Unable to enumerate containers")
+    alldbfpvcs = getDBaaS(objtype='dbf')
+    if alldbfpvcs['RESULT']:
+        userio.fail("Unable to enumerate datafile volumes")
+    alllogpvcs = getDBaaS(objtype='log')
+    if alllogpvcs['RESULT']:
+        userio.fail("Unable to enumerate log volumes")
+    if len(allhaservices['OBJS'].keys()) + \
+       len(allcontainers['OBJS'].keys()) + \
+       len(alldbfpvcs['OBJS'].keys()) + \
+       len(alllogpvcs['OBJS'].keys()) > 0:
+        if uuid is None:
+            dbaaslist = list(set(allhaservices['OBJS'].keys() +
+                                 allcontainers['OBJS'].keys() +
+                                 alldbfpvcs['OBJS'].keys() +
+                                 alllogpvcs['OBJS'].keys()))
+            dbaaslist.sort()
+        else:
+            dbaaslist = [uuid]
+        grid.append(['UUID'] + allobjkeys)
+        for item in dbaaslist:
+            newrow = [item]
+            if item in allhaservices['OBJS'].keys():
+                for key in allobjkeys:
+                    try:
+                        newrow.append(allhaservices['OBJS'][item][key])
+                    except KeyError:
+                        newrow.append('')
+                grid.append(newrow)
+            newrow = [item]
+            if item in allcontainers['OBJS'].keys():
+                for key in allobjkeys:
+                    try:
+                        newrow.append(allcontainers['OBJS'][item][key])
+                    except KeyError:
+                        newrow.append('')
+                grid.append(newrow)
+            newrow = [item]
+            if item in alldbfpvcs['OBJS'].keys():
+                for key in allobjkeys:
+                    try:
+                        newrow.append(alldbfpvcs['OBJS'][item][key])
+                    except KeyError:
+                        newrow.append('')
+                grid.append(newrow)
+            newrow = [item]
+            if item in alllogpvcs['OBJS'].keys():
+                for key in allobjkeys:
+                    try:
+                        newrow.append(alllogpvcs['OBJS'][item][key])
+                    except KeyError:
+                        newrow.append('')
+                grid.append(newrow)
+        userio.grid(grid)
+
+if mode == 'cli':
+    allhaservices = getDBaaS(objtype='container', uuid=uuid)
+    if len(allhaservices['OBJS']) < 1:
+        userio.fail("DBaaS container with uuid " + uuid + " not found")
+    containername = allhaservices['OBJS'][uuid]['name']
+    os.execvpe('kubectl', ['kubectl', 'exec', '-ti', containername, '--', '/bin/bash'], {'KUBECONFIG': '/etc/kubernetes/admin.conf'})
+
+if cleanup and go:
+    for file in tempfiles:
+        os.remove(file)
