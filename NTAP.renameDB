@@ -1,0 +1,508 @@
+#!/usr/bin/python
+###########################################################################
+# (c) 2019 NetApp Inc. (NetApp), All Rights Reserved
+#
+# NetApp disclaims all warranties, excepting NetApp shall provide
+# support of unmodified software pursuant to a valid, separate,
+# purchased support agreement.  No distribution or modification of
+# this software is permitted by NetApp, except under separate
+# written agreement, which may be withheld at NetApp's sole
+# discretion.
+#
+# THIS SOFTWARE IS PROVIDED BY NETAPP "AS IS" AND ANY EXPRESS OR
+# IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+# WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+# ARE DISCLAIMED. IN NO EVENT SHALL NETAPP BE LIABLE FOR ANY DIRECT,
+# INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+# (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+# SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
+# HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT,
+# STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+# ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED
+# OF THE POSSIBILITY OF SUCH DAMAGE.
+#
+# Created by Jeffrey Steiner, jfs@netapp.com
+#
+###########################################################################
+
+###########################################################################
+#
+# This is a script that renames a database. 
+#
+# It assumes that all datafiles will be located at /oradata/SID and all
+# archive, redo, and controlfiles will be in /logs/SID
+#
+###########################################################################
+
+import sys
+import os
+import re
+sys.path.append(sys.path[0] + "/NTAPlib")
+from dosqlplus import dosqlplus as dosqlplus
+from doprocess import doprocess as doprocess
+import userio
+import orautils
+import getopt
+
+
+def printusageanddie():
+    sys.stdout.write("startDB --sid [Oracle SID]\n")
+    sys.stdout.write("        --newsid [New Oracle SID]\n")
+    sys.stdout.write("        --newpdb [Oracle PDB, if >=12.2.0.1]\n")
+    sys.stdout.write("        --noarchive [disable archivelogging]\n")
+    sys.exit(1)
+
+
+newenv = {}
+oldenv = {}
+version = None
+neworaclesid = None
+oraclesid = None
+neworaclepdb = None
+oraclebase = '/orabin'
+dbconfig = []
+pdbmode = False
+dropsignals = False
+noarchive = False
+
+try:
+    options, args = getopt.getopt(sys.argv[1:], '', ["sid=", "newsid=", "newpdb="])
+except getopt.GetoptError as e:
+    userio.fail(str(e))
+
+for o, a in options:
+    if o == '--sid':
+        oraclesid = a
+    elif o == '--newsid':
+        neworaclesid = a
+    elif o == '--newpdb':
+        neworaclepdb = a
+        pdbmode = True
+    elif o == '--password':
+        password = a
+    elif o == '--noarchive':
+        noarchive = True
+
+if oraclesid is None or neworaclesid is None:
+    printusageanddie()
+
+userio.message("ORACLE_SID is " + oraclesid, prenewline=True)
+userio.message("New ORACLE_SID will be " + neworaclesid, prenewline=True)
+
+if oraclesid == neworaclesid:
+    userio.fail("Old and new ORACLE_SIDs are the same")
+
+oraclehome = orautils.getoraclehome(oraclesid)
+if oraclehome is None:
+    userio.fail("Unable to get ORACLE_HOME for SID " + oraclesid)
+
+userio.message("Starting database", prenewline=True)
+out = dosqlplus(oraclesid, ['startup mount;',
+                            'recover automatic;',
+                            'alter database open;'],
+                home=oraclehome, base=oraclebase, printstdout=True)
+if out['RESULT'] > 0 or out['ERRORFLAG'] > 0:
+    for line in out['STDOUT']:
+        userio.message("SQLPLUS STDOUT:" + line)
+    for line in out['STDERR']:
+        userio.message("SQLPLUS STDERR:" + line)
+    userio.fail("Unable to start database")
+
+userio.message("Retrieving database version", prenewline=True)
+out = dosqlplus(oraclesid, ['select version from v$instance;'], home=oraclehome, base=oraclebase, printstdout=False)
+if out['RESULT'] > 0:
+    for line in out['STDOUT']:
+        userio.message("SQLPLUS STDOUT:" + line)
+    for line in out['STDERR']:
+        userio.message("SQLPLUS STDERR:" + line)
+    userio.fail("Unable to start database")
+
+version = out['STDOUT'][0]
+userio.message("Oracle version is " + version)
+
+fields = map(int, version.split('.'))
+if fields[0] >= 12 and fields[1] >= 2:
+    pdbmode = True
+    userio.message("Identifying PDB name", prenewline=False)
+    commandblock = []
+    commandblock.append("select name from v$pdbs where name !='PDB$SEED';")
+    out = dosqlplus(oraclesid, commandblock, home=oraclehome, base=oraclebase)
+
+    if out['RESULT'] > 0:
+        userio.fail("Unable to enumerate PDBs")
+    elif len(out['STDOUT']) > 1:
+        userio.fail("Databases with multiple PDBs are not supported")
+    else:
+        oraclepdb = out['STDOUT'][0]
+        userio.message("ORACLE_PDB is " + oraclepdb)
+        if neworaclepdb is None:
+            neworaclepdb = oraclepdb
+        elif not oraclepdb == neworaclepdb:
+            userio.message("New ORACLE_PDB will be " + neworaclepdb)
+
+contents = os.listdir('/oradata')
+contents.remove('.snapshot')
+if len(contents) > 1:
+    userio.fail("Found unexpected item in /oradata")
+
+pwfile = "/logs/" + oraclesid + "/dbconfig/orapw" + oraclesid
+pwlink = oraclehome + "/dbs/orapw" + oraclesid
+
+spfile = "/logs/" + oraclesid + "/dbconfig/spfile" + oraclesid + ".ora"
+splink = oraclehome + "/dbs/spfile" + oraclesid + ".ora"
+
+newpwfile = "/logs/" + neworaclesid + "/dbconfig/orapw" + neworaclesid
+newspfile = "/logs/" + neworaclesid + "/dbconfig/spfile" + neworaclesid + ".ora"
+newsplink = oraclehome + "/dbs/spfile" + neworaclesid + ".ora"
+
+userio.message("Temporarily setting ORACLE_SID to " + oraclesid, prenewline=True)
+if not os.path.exists("/orabin/admin/" + oraclesid + "/adump"):
+    userio.message("Creating audit directory at /orabin/admin/" + oraclesid + "/adump", prenewline=True)
+    os.makedirs("/orabin/admin/" + oraclesid + "/adump")
+if not os.path.exists(pwlink):
+    userio.message('Linking ' + pwfile + ' to ' + pwlink, prenewline=True)
+    os.symlink(pwfile, pwlink)
+if not os.path.exists(splink):
+    userio.message('Linking ' + spfile + ' to ' + splink, prenewline=True)
+    os.symlink(spfile, splink)
+
+userio.message("Discovering datafiles...", prenewline=True)
+commandblock = []
+commandblock.append('select name from v$datafile;')
+commandblock.append('select name from v$tempfile;')
+out = dosqlplus(oraclesid, commandblock, home=oraclehome, base=oraclebase)
+if out['RESULT'] > 0:
+    userio.fail("Unable to enumerate datafiles")
+datafiles = out['STDOUT']
+for item in datafiles:
+    userio.message("  " + item)
+
+userio.message("Discovering controlfiles...", prenewline=True)
+commandblock = []
+commandblock.append("select value from v$parameter where name='control_files';")
+out = dosqlplus(oraclesid, commandblock, home=oraclehome, base=oraclebase)
+if out['RESULT'] > 0:
+    userio.fail("Unable to enumerate controlfiles")
+controlfiles = out['STDOUT'][0].split(', ')
+for item in controlfiles:
+    userio.message("  " + item)
+
+userio.message("Discovering redologs...", prenewline=True)
+commandblock = []
+commandblock.append("select member from v$logfile;")
+out = dosqlplus(oraclesid, commandblock, home=oraclehome, base=oraclebase)
+if out['RESULT'] > 0:
+    userio.fail("Unable to enumerate redologs")
+redologs = out['STDOUT']
+for item in redologs:
+    userio.message("  " + item)
+
+if pdbmode:
+    userio.message("Identifying PDB datafiles", prenewline=True)
+    commandblock = []
+    commandblock.append('alter session set container=' + oraclepdb + ';')
+    commandblock.append('select name from v$datafile;')
+    commandblock.append('select name from v$tempfile;')
+    out = dosqlplus(oraclesid, commandblock, home=oraclehome, base=oraclebase)
+    if out['RESULT'] > 0:
+        userio.fail("Unable to enumerate PDB datafiles")
+    pdbdatafiles = out['STDOUT']
+    for item in pdbdatafiles:
+        userio.message("  " + item)
+
+    userio.message("Identifying PDB seed datafiles", prenewline=True)
+    commandblock = []
+    commandblock.append('alter session set container=PDB$SEED;')
+    commandblock.append('select name from v$datafile;')
+    commandblock.append('select name from v$tempfile;')
+    out = dosqlplus(oraclesid, commandblock, home=oraclehome, base=oraclebase)
+    if out['RESULT'] > 0:
+        userio.fail("Unable to enumerate PDB seed datafiles")
+    pdbseeddatafiles = out['STDOUT']
+    for item in pdbseeddatafiles:
+        userio.message("  " + item)
+
+    userio.message("Identifying CDB datafiles", prenewline=True)
+    cdbdatafiles = list(datafiles)
+    for item in pdbdatafiles:
+        cdbdatafiles.remove(item)
+    for item in pdbseeddatafiles:
+        cdbdatafiles.remove(item)
+    for item in cdbdatafiles:
+        userio.message("  " + item)
+
+userio.message("Creating pfile at /tmp/pfile.bak", prenewline=True)
+commandblock = []
+commandblock.append("create pfile = '/tmp/pfile.bak' from spfile;")
+out = dosqlplus(oraclesid, commandblock, home=oraclehome, base=oraclebase)
+if out['RESULT'] > 0:
+    userio.fail("Unable to create pfile")
+
+if pdbmode and not oraclepdb == neworaclepdb:
+    userio.message("Renaming PDB " + oraclepdb + " to " + neworaclepdb, prenewline=True)
+    commandblock = []
+    commandblock.append('alter pluggable database ' + oraclepdb + ' close;')
+    commandblock.append('alter pluggable database ' + oraclepdb + ' open restricted;')
+    commandblock.append("alter session set container=" + oraclepdb + ";")
+    commandblock.append('alter pluggable database rename GLOBAL_NAME to ' + neworaclepdb + ';')
+    commandblock.append('alter pluggable database ' + neworaclepdb + ' close;')
+    commandblock.append('alter pluggable database ' + neworaclepdb + ' open;')
+    commandblock.append('alter pluggable database ' + neworaclepdb + ' save state;')
+    out = dosqlplus(oraclesid, commandblock, home=oraclehome, base=oraclebase, printstdout=True)
+
+userio.message("Shutting down database and restarting in MOUNT mode")
+out = dosqlplus(oraclesid, ['shutdown immediate;',
+                            'startup mount;'],
+                home=oraclehome, base=oraclebase, printstdout=True)
+
+myenv = {"ORACLE_HOME": oraclehome, "ORACLE_SID": oraclesid, "ORACLE_BASE": oraclebase}
+userio.message("Renaming SID, this may take a minute or two...", prenewline=True)
+out = doprocess(oraclehome + "/bin/nid target=/ dbname=" + neworaclesid, input="y\n", env=myenv)
+
+for line in out['STDERR']:
+    userio.message("  " + line)
+
+userio.message("Moving datafiles to /oradata/" + neworaclesid, prenewline=True)
+os.rename("/oradata/" + oraclesid, "/oradata/" + neworaclesid)
+
+if pdbmode and not oraclepdb == neworaclepdb:
+    userio.message("Moving PDB datafiles to /oradata/" + neworaclesid, prenewline=True)
+    os.rename("/oradata/" + neworaclesid + "/" + oraclepdb, "/oradata/" + neworaclesid + "/" + neworaclepdb)
+
+userio.message("Removing old spfile", prenewline=True)
+try:
+    os.remove(spfile)
+    os.remove(splink)
+except OSError, e:
+    if type(e) == exceptions.OSerror and e.errno == 2:
+        userio.warn(e)
+
+userio.message("Changing base log directory to /logs/" + neworaclesid, prenewline=True)
+os.rename("/logs/" + oraclesid, "/logs/" + neworaclesid)
+
+userio.message("Renaming old password file", prenewline=True)
+if os.path.islink(newpwfile):
+    os.remove(newpwfile)
+os.rename('/logs/' + neworaclesid + '/dbconfig/orapw' + oraclesid, newpwfile)
+
+if not os.path.islink(oraclehome + "/dbs/orapw" + neworaclesid):
+    userio.message("Linking orapw" + neworaclesid + " to /logs/" + neworaclesid + "/dbconfig/orapw" + neworaclesid, prenewline=True)
+    os.symlink('/logs/' + neworaclesid + '/dbconfig/orapw' + neworaclesid, oraclehome + "/dbs/orapw" + neworaclesid)
+
+userio.message("Updating and copying oratab file", prenewline=True)
+out = doprocess("sed -i -e s/" + oraclesid + ":/" + neworaclesid + ":/ /logs/" + neworaclesid + "/dbconfig/oratab")
+if out['RESULT'] > 0:
+    userio.fail("Failed to update oratab file at /logs/" + neworaclesid + "/dbconfig/oratab")
+out = doprocess("cp /logs/" + neworaclesid + "/dbconfig/oratab /etc/oratab")
+if out['RESULT'] > 0:
+    userio.fail("Failed to copy /logs/" + neworaclesid + "/dbconfig/oratab to /etc/oratab")
+
+file = '/logs/' + neworaclesid + '/dbconfig/sqlnet.ora'
+symlink = oraclehome + '/network/admin/sqlnet.ora'
+if os.path.isfile(symlink) and not os.path.islink(symlink):
+    userio.message("Discovered file instead of symlink at " + symlink, prenewline=True)
+    if os.path.isfile(file):
+        userio.message('Removing stale file at ' + file)
+        os.remove(file)
+    userio.message('Moving ' + symlink + ' to ' + file)
+    out = doprocess("mv " + symlink + " " + file)
+elif not os.path.islink(symlink):
+    userio.message('Linking ' + file + ' to ' + symlink, prenewline=True)
+    os.symlink(file, symlink)
+
+userio.message("Creating and linking tnsnames file", prenewline=True)
+if pdbmode:
+    svcname = neworaclepdb
+else:
+    svcname = neworaclesid
+fileh = open("/logs/" + neworaclesid + "/dbconfig/tnsnames.ora", 'w')
+fileh.write(neworaclesid + "=localhost:1521/" + neworaclesid + "\n")
+fileh.write(svcname + "=\n")
+fileh.write("(DESCRIPTION =\n")
+fileh.write("  (ADDRESS = (PROTOCOL = TCP)(HOST = 0.0.0.0)(PORT = 1521))\n")
+fileh.write("  (CONNECT_DATA =\n")
+fileh.write("    (SERVER = DEDICATED)\n")
+fileh.write("    (SERVICE_NAME = " + svcname + "\n")
+fileh.write("  )\n")
+fileh.write(")\n")
+fileh.close()
+if os.path.isfile(oraclehome + "/network/admin/tnsnames.ora") or os.path.islink(oraclehome + "/network/admin/tnsnames.ora"):
+    os.remove(oraclehome + "/network/admin/tnsnames.ora")
+os.symlink("/logs/" + neworaclesid + "/dbconfig/tnsnames.ora", oraclehome + "/network/admin/tnsnames.ora")
+
+psoutput = doprocess("ps -eo cmd")
+for line in psoutput:
+    if 'tnslsnr' in line:
+        doprocess("lsnrctl stop", env=newenv)
+userio.message("Creating and linking listener.ora file", prenewline=True)
+fileh = open("/logs/" + neworaclesid + "/dbconfig/listener.ora", 'w')
+fileh.write("LISTENER =\n")
+fileh.write("(DESCRIPTION_LIST =\n")
+fileh.write("  (DESCRIPTION =\n")
+fileh.write("    (ADDRESS = (PROTOCOL = IPC)(KEY = EXTPROC1))\n")
+fileh.write("    (ADDRESS = (PROTOCOL = TCP)(HOST = 0.0.0.0)(PORT = 1521))\n")
+fileh.write("  )\n")
+fileh.write(")\n")
+fileh.close()
+if os.path.exists(oraclehome + "/network/admin/listener.ora") or os.path.islink(oraclehome + "/network/admin/listener.ora"):
+    os.remove(oraclehome + "/network/admin/listener.ora")
+os.symlink("/logs/" + neworaclesid + "/dbconfig/listener.ora", oraclehome + "/network/admin/listener.ora")
+
+userio.message("Removing old symlinks", prenewline=True)
+try:
+    os.remove(splink)
+    os.remove(pwlink)
+except OSError, e:
+    if type(e) == exceptions.OSerror and e.errno == 2:
+        userio.warn(e)
+
+userio.message("Modifying pfile", prenewline=True)
+
+pfilelines = open("/tmp/pfile.bak", 'r').read().splitlines()
+removeparams = ['dispatchers', 'log_archive_dest', 'db_name', 'control_files', 'audit_file_dest']
+newpfile = open("/tmp/pfile.new", 'w')
+
+for line in pfilelines:
+    for param in removeparams:
+        if param + '=' in line:
+            userio.message("   removing parameter-> " + line)
+            pfilelines.remove(line)
+
+for line in pfilelines:
+    if line[:len(oraclesid)] == oraclesid:
+        newline = re.sub(r'^' + oraclesid + '.', neworaclesid + ".", line)
+        userio.message("     adding parameter-> " + newline)
+        newpfile.write(newline + "\n")
+    else:
+        userio.message("     adding parameter-> " + line)
+        newpfile.write(line + "\n")
+
+newline = "*.db_name='" + neworaclesid + "'"
+userio.message("     adding parameter-> " + newline)
+newpfile.write(newline + "\n")
+
+newline = "*.dispatchers='(PROTOCOL=TCP) (SERVICE=" + neworaclesid + "XDB)'"
+userio.message("     adding parameter-> " + newline)
+newpfile.write(newline + "\n")
+
+newline = "*.control_files="
+for file in controlfiles:
+    newcontrolfilepath = '/logs/' + neworaclesid + "/ctrl/" + file.split('/')[-1]
+    if not os.path.exists(newcontrolfilepath):
+        userio.warn("Cannot find controlfile at " + newcontrolfilepath)
+    newline = newline + "'" + newcontrolfilepath + "',"
+newline = newline[:-1]
+userio.message("     adding parameter-> " + newline)
+newpfile.write(newline + "\n")
+
+newline = "*.audit_file_dest='/orabin/admin/" + neworaclesid + "/adump'"
+userio.message("     adding parameter-> " + newline)
+newpfile.write(newline + "\n")
+
+newpfile.close()
+
+if not os.path.exists('/orabin/admin/' + neworaclesid + '/adump'):
+    os.makedirs('/orabin/admin/' + neworaclesid + '/adump')
+
+if os.path.isfile(newsplink) or os.path.islink(newsplink):
+    userio.message("Removing " + newsplink, prenewline=True)
+    os.remove(newsplink)
+
+userio.message("Importing temporary pfile", prenewline=True)
+commandblock = []
+commandblock.append("create spfile from pfile = '/tmp/pfile.new';")
+out = dosqlplus(neworaclesid, commandblock, home=oraclehome, base=oraclebase, printstdout=True)
+
+userio.message("Relocating " + newsplink + " to " + newspfile, prenewline=True)
+if os.path.exists(newspfile):
+    os.remove(newspfile)
+
+out = doprocess("mv " + newsplink + " " + newspfile)
+
+userio.message("Linking " + newsplink + " to " + newspfile, prenewline=True)
+os.symlink(newspfile, newsplink)
+
+userio.message("Starting database in mount mode", prenewline=True)
+commandblock = []
+commandblock.append('startup mount;')
+out = dosqlplus(neworaclesid, commandblock, home=oraclehome, base=oraclebase, printstdout=True)
+
+commandblock = []
+if noarchive:
+    userio.message("Disabling archive logging", prenewline=True)
+    commandblock.append("alter database noarchivelog;")
+else:
+    userio.message("Enabling log archival to /logs/" + neworaclesid + "/arch", prenewline=True)
+    commandblock.append("alter system set log_archive_dest='/logs/" + neworaclesid + "/arch' scope=spfile;")
+    commandblock.append("alter database archivelog;")
+out = dosqlplus(neworaclesid, commandblock, home=oraclehome, base=oraclebase, printstdout=True)
+
+if pdbmode:
+    userio.message("Updating CDB datafile locations", prenewline=True)
+    commandblock = []
+    for file in cdbdatafiles:
+        newfile = ("/oradata/" + neworaclesid + '/' + file.split('/')[-1])
+        userio.message("  -> " + newfile)
+        nextline = ("alter database rename file '" + file + "' to '" + newfile + "';")
+        commandblock.append(nextline)
+    out = dosqlplus(neworaclesid, commandblock, home=oraclehome, base=oraclebase, printstdout=True)
+
+    userio.message("Updating PDB seed datafile locations", prenewline=True)
+    commandblock = []
+    for file in pdbseeddatafiles:
+        newfile = ("/oradata/" + neworaclesid + '/pdbseed/' + file.split('/')[-1])
+        userio.message("  -> " + newfile)
+        nextline = ("alter database rename file '" + file + "' to '" + newfile + "';")
+        commandblock.append(nextline)
+    out = dosqlplus(neworaclesid, commandblock, home=oraclehome, base=oraclebase, printstdout=True)
+
+    userio.message("Updating PDB datafile locations", prenewline=True)
+    commandblock = []
+    for file in pdbdatafiles:
+        newfile = ("/oradata/" + neworaclesid + '/' + neworaclepdb + '/' + file.split('/')[-1])
+        userio.message("  -> " + newfile)
+        nextline = ("alter database rename file '" + file + "' to '" + newfile + "';")
+        commandblock.append(nextline)
+    out = dosqlplus(neworaclesid, commandblock, home=oraclehome, base=oraclebase, printstdout=True)
+else:
+    userio.message("Updating datafile locations", prenewline=True)
+    commandblock = []
+    for file in datafiles:
+        newfile = ("/oradata/" + neworaclesid + '/' + file.split('/')[-1])
+        userio.message("  -> " + newfile)
+        nextline = ("alter database rename file '" + file + "' to '" + newfile + "';")
+        commandblock.append(nextline)
+    out = dosqlplus(neworaclesid, commandblock, home=oraclehome, base=oraclebase, printstdout=True)
+
+userio.message("Updating redo log locations", prenewline=True)
+commandblock = []
+for file in redologs:
+    newfile = ("/logs/" + neworaclesid + '/redo/' + file.split('/')[-1])
+    userio.message("  -> " + newfile)
+    nextline = ("alter database rename file '" + file + "' to '" + newfile + "';")
+    commandblock.append(nextline)
+out = dosqlplus(neworaclesid, commandblock, home=oraclehome, base=oraclebase, printstdout=True)
+
+userio.message("Starting listener", prenewline=True)
+doprocess("lsnrctl start", env=newenv)
+
+userio.message("Opening database with resetlogs", prenewline=True)
+commandblock = []
+commandblock.append('alter database open resetlogs;')
+out = dosqlplus(neworaclesid, commandblock, home=oraclehome, base=oraclebase, printstdout=True)
+
+userio.message("Removing old /orabin/diag/rdbms/" + oraclesid.lower() + " files", prenewline=True)
+for path, dirs, files in os.walk('/orabin/diag/rdbms/' + oraclesid.lower(), topdown=False):
+    for file in files:
+        os.remove(os.path.join(path, file))
+    for dir in dirs:
+        os.rmdir(os.path.join(path, dir))
+os.rmdir('/orabin/diag/rdbms/' + oraclesid.lower())
+
+userio.message("Removing old /orabin/admin/" + oraclesid + " files", prenewline=True)
+for path, dirs, files in os.walk('/orabin/admin/' + oraclesid, topdown=False):
+    for file in files:
+        os.remove(os.path.join(path, file))
+    for dir in dirs:
+        os.rmdir(os.path.join(path, dir))
+os.rmdir('/orabin/admin/' + oraclesid)
