@@ -1,0 +1,41 @@
+#! /usr/bin/bash
+###########################################################################
+# (c) 2019 NetApp Inc. (NetApp), All Rights Reserved
+#
+# NetApp disclaims all warranties, excepting NetApp shall provide
+# support of unmodified software pursuant to a valid, separate,
+# purchased support agreement.  No distribution or modification of
+# this software is permitted by NetApp, except under separate
+# written agreement, which may be withheld at NetApp's sole
+# discretion.
+#
+# THIS SOFTWARE IS PROVIDED BY NETAPP "AS IS" AND ANY EXPRESS OR
+# IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+# WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+# ARE DISCLAIMED. IN NO EVENT SHALL NETAPP BE LIABLE FOR ANY DIRECT,
+# INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+# (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+# SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
+# HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT,
+# STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+# ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED
+# OF THE POSSIBILITY OF SUCH DAMAGE.
+#
+# Created by Jeffrey Steiner, jfs@netapp.com
+#
+###########################################################################
+
+###########################################################################
+#
+# This is just a wrapped that called NTAP.startDB from a bash shell.
+# I discovered that if I call the NTAP.startDB directly as the lead
+# process in the container, it won't terminate correctly.
+#
+# Using a shell command to call NTAP.startDB fixes the problem.
+#
+# If anyone can explain what was happening, let me know. Details
+# are at https://words.ofsteiner.com/2019/01/02/kubernetesontap-dbaas-part-4-orchestration/
+#
+###########################################################################
+
+/orabin/NTAP.startDB "$@"

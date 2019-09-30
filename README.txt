@@ -33,7 +33,7 @@ There might be more posts by the time you read this README, but look down the pa
 
 The imporant things are as follows:
 
-**DATABASE LAYOUT**
+DATABASE LAYOUT
 
 The database layout is hard-coded to use the following format:
 
@@ -46,19 +46,19 @@ The database layout is hard-coded to use the following format:
 The reason for this is predictability. The various utilities and approach to snapshots requires
 placing data in known locations with known snapshot schedules. 
 
-**SNAPSHOT SCHEDULES**
+SNAPSHOT SCHEDULES
 
 At the start of the main dbaas management utility, you'll see a couple of variables for snapshot policies. They are currently set as "docker-datafiles" and "docker-logs". You can customize these as required, but it's important that the policy creates datafile snapshots *before* it creates log snapshots. 
 
-**VOLUME SIZES**
+VOLUME SIZES
 
 You'll also see the default datafile and log volume sizes set at the start of dbfvolsize and logvolsize
 
-**SSH ACCESS**
+SSH ACCESS
 
 Replace the contents of NTAP.authorized_keys with the authorized_keys file you'd like to place in the container. 
 
-**DEBUGGING dbaas OPERATIONS**
+DEBUGGING dbaas OPERATIONS
 
 You can always use --trace to follow the logs of a provision, create, or clone command. 
 

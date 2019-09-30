@@ -1,0 +1,99 @@
+#! /usr/bin/python
+###########################################################################
+# (c) 2019 NetApp Inc. (NetApp), All Rights Reserved
+#
+# NetApp disclaims all warranties, excepting NetApp shall provide
+# support of unmodified software pursuant to a valid, separate,
+# purchased support agreement.  No distribution or modification of
+# this software is permitted by NetApp, except under separate
+# written agreement, which may be withheld at NetApp's sole
+# discretion.
+#
+# THIS SOFTWARE IS PROVIDED BY NETAPP "AS IS" AND ANY EXPRESS OR
+# IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+# WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+# ARE DISCLAIMED. IN NO EVENT SHALL NETAPP BE LIABLE FOR ANY DIRECT,
+# INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+# (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+# SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
+# HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT,
+# STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+# ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED
+# OF THE POSSIBILITY OF SUCH DAMAGE.
+#
+# Created by Jeffrey Steiner, jfs@netapp.com
+#
+###########################################################################
+
+###########################################################################
+#
+# The primary purpose of this script is to build the dockerfiles in a
+# common location without having to place all the various installers in
+# that directory.
+#
+# You should only build one image at a time. The script will move the
+# required installers in and out of ../installers as required. If I stored
+# all the possible installers in the dockerfile build directory all the
+# time it would result in a huge image.
+#
+###########################################################################
+
+import sys
+import os
+sys.path.append(sys.path[0] + "/NTAPlib")
+import signal
+from userio import message
+from userio import fail
+from userio import ctrlc
+from userio import warn
+from userio import justexit
+from doprocess import doprocess as doprocess
+
+
+def printusageanddie():
+    sys.stderr.write("syntax:  ./buildit [Oracle version]\n")
+    knownversions = installers.keys()
+    knownversions.sort(reverse=True)
+    for version in knownversions:
+        sys.stderr.write("                      " + version + "\n")
+    sys.exit(1)
+
+
+def moveinstallers(version):
+    if not os.path.isdir("../installers"):
+        fail("Unable to find Oracle installer directory at ../installers")
+    for key in installers.keys():
+        if key == version:
+            for installfile in installers[key]:
+                if os.path.isfile("../installers/" + installfile):
+                    os.rename("../installers/" + installfile, "./" + installfile)
+                elif not os.path.isfile("./" + installfile):
+                    fail("Unable to find Oracle installer: " + installfile)
+        else:
+            for installfile in installers[key]:
+                if os.path.isfile("./" + installfile):
+                    os.rename("./" + installfile, "../installers/" + installfile)
+
+
+# main
+installers = {'12.2.0.1': ['12.2.0.1.zip'],
+              '12.1.0.2': ['12.1.0.2-1.zip', '12.1.0.2-2.zip'],
+              '11.2.0.4': ['11.2.0.4-1.zip', '11.2.0.4-2.zip']}
+
+signal.signal(signal.SIGINT, ctrlc)
+
+if not len(sys.argv) == 2:
+    printusageanddie()
+version = sys.argv[1]
+if version not in installers.keys():
+    printusageanddie()
+else:
+    moveinstallers(version)
+    out = doprocess("docker build --force-rm=true --no-cache=true -t database:" +
+                    version +
+                    "-ntap -f Dockerfile." +
+                    version + ".ntap .",
+                    printstdout=True)
+    if out['RESULT'] > 0:
+        message(out['STDOUT'])
+        message(out['STDERR'])

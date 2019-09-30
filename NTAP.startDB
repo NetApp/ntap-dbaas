@@ -1,0 +1,245 @@
+#!/usr/bin/python
+###########################################################################
+# (c) 2019 NetApp Inc. (NetApp), All Rights Reserved
+#
+# NetApp disclaims all warranties, excepting NetApp shall provide
+# support of unmodified software pursuant to a valid, separate,
+# purchased support agreement.  No distribution or modification of
+# this software is permitted by NetApp, except under separate
+# written agreement, which may be withheld at NetApp's sole
+# discretion.
+#
+# THIS SOFTWARE IS PROVIDED BY NETAPP "AS IS" AND ANY EXPRESS OR
+# IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+# WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+# ARE DISCLAIMED. IN NO EVENT SHALL NETAPP BE LIABLE FOR ANY DIRECT,
+# INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+# (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+# SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
+# HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT,
+# STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+# ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED
+# OF THE POSSIBILITY OF SUCH DAMAGE.
+#
+# Created by Jeffrey Steiner, jfs@netapp.com
+#
+###########################################################################
+
+###########################################################################
+#
+# This is the main databsae startup script. There are a number of important
+# hard-coded behaviors.
+#
+# First, it's expecting datafiles and log files to be in particular
+# locations as explained in the README file.
+#
+# Second, if the target filesystems are EMPTY, it presumes that a new
+# database should be built and NTAP.createDB will be called.
+#
+# Third, if the target filesystems appear to be configured for one
+# AND ONLY ONE database, but the SID does not match, it will call
+# NTAP.renameDB to change the name. The primary reason for this feature
+# is cloning support. You can create a new container based on a clone
+# of a previous container and then reset the Oracle SID to a different
+# name. This is generally optional, though, beacuse containerization does
+# permit the use of the same SID on the same OS repeatedly.
+#
+###########################################################################
+
+import sys
+import os
+import signal
+sys.path.append(sys.path[0] + "/NTAPlib")
+from dosqlplus import dosqlplus as dosqlplus
+from doprocess import doprocess as doprocess
+import userio
+import getopt
+import time
+
+
+def signal2shutdown(signum, frame):
+    if not dropsignals:
+        userio.linefeed()
+        if signum == signal.SIGINT:
+            userio.message("Received SIGINT, stopping container", prelinefeed=True)
+        elif signum == signal.SIGTERM:
+            userio.message("Received SIGTERM, stopping container", prelinefeed=True)
+        out = dosqlplus(oraclesid, 'shutdown immediate;', home=oraclehome, base=oraclebase, printstdout=True)
+        userio.message("Stopping listener")
+        os.system("lsnrctl stop")
+    sys.exit(0)
+
+
+def printusageanddie():
+    sys.stdout.write("startDB --sid [Oracle SID]\n")
+    sys.stdout.write("        --pdb [Oracle PDB, if >=12.2.0.1]\n")
+    sys.stdout.write("        --password [password to assign at DB creation time]\n")
+    sys.stdout.write("        --version [Oracle version, such as 12.2.0.1]\n")
+    sys.stdout.write("        --charset [Character set for new databases]\n")
+    sys.stdout.write("        --noarchive [disable archivelogging]\n")
+    sys.exit(1)
+
+
+signal.signal(signal.SIGINT, signal2shutdown)
+signal.signal(signal.SIGTERM, signal2shutdown)
+
+version = None
+oraclesid = None
+oraclepdb = None
+password = 'oracle'
+knownversions = ['12.2.0.1', '12.1.0.2', '11.2.0.4']
+oraclebase = '/orabin'
+dbconfig = []
+pdbmode = False
+dropsignals = False
+noarchive = False
+spin = False
+
+try:
+    options, args = getopt.getopt(sys.argv[1:], '', ["sid=", "pdb=", "password=", "version=", "spin"])
+except getopt.GetoptError as e:
+    userio.fail(str(e))
+
+for o, a in options:
+    if o == '--sid':
+        oraclesid = a
+    elif o == '--pdb':
+        oraclepdb = a
+        pdbmode = True
+    elif o == '--password':
+        password = a
+    elif o == '--version':
+        version = a
+    elif o == '--charset':
+        charset = a
+    elif o == '--noarchive':
+        noarchive = True
+    elif o == '--spin':
+        spin = True
+
+if oraclesid is None or version is None:
+    printusageanddie()
+
+if version not in knownversions:
+    userio.fail("Oracle version " + version + " not recognized")
+
+if pdbmode and oraclepdb == oraclesid:
+    userio.fail("Error: PDB name cannot be the same as the SID")
+
+fields = map(int, version.split('.'))
+if fields[0] >= 12 and fields[1] >= 2 and oraclepdb == '':
+    userio.fail("PDB name required for >12.2.0.1")
+
+userio.message("ORACLE_SID is " + oraclesid)
+
+if oraclepdb is not None:
+    dbmode = True
+    userio.message("ORACLE_PDB is " + oraclepdb)
+
+oraclehome = os.path.join(oraclebase, 'product', version, 'dbhome_1')
+
+if not os.path.isdir(oraclehome):
+    userio.fail("Cannot find ORACLE_HOME at " + os.path.join(oraclebase, product, version))
+else:
+    userio.message("ORACLE_HOME is " + oraclehome)
+
+if not os.path.isdir("/oradata"):
+    userio.fail("/oradata volume is missing")
+
+if not os.path.isdir("/logs"):
+    userio.fail("/logs volume is missing")
+
+if os.path.isfile("/logs/" + oraclesid + "/ssh/authorized_keys"):
+    os.system("cat /logs/" + oraclesid + "/ssh/authorized_keys > /home/oracle/.ssh/authorized_keys")
+
+oradatacontents = os.listdir("/oradata")
+logcontents = os.listdir("/logs")
+
+if len(oradatacontents) > 0 and '.snapshot' in oradatacontents:
+    oradatacontents.remove('.snapshot')
+if len(logcontents) > 0 and '.snapshot' in logcontents:
+    logcontents.remove('.snapshot')
+
+myenv = {"ORACLE_HOME": oraclehome, "ORACLE_SID": oraclesid, "ORACLE_BASE": oraclebase}
+if pdbmode:
+    myenv['ORACLE_PDB'] = oraclepdb
+
+if len(oradatacontents) == 0 and len(logcontents) == 0:
+    userio.banner("/oradata and /logs volumes are empty, creating new database")
+    out = doprocess("/orabin/NTAP.createDB " + ' '.join(sys.argv[1:]), env=myenv, printstdout=True)
+    if out['RESULT'] > 0:
+        userio.banner("Database creation failed")
+        for line in out['STDERR']:
+            userio.message("STDERR -> " + line)
+        userio.justexit()
+    os.system("lsnrctl start")
+elif os.path.isdir('/oradata/' + oraclesid) is False and os.path.isdir('/logs/' + oraclesid) is False:
+    contents = os.listdir('/oradata')
+    contents.remove('.snapshot')
+    if len(contents) > 1:
+        userio.fail("Found unexpected item in /oradata")
+    else:
+        oldsid = contents[0]
+        userio.message("Current SID is " + oldsid, prenewline=True)
+        userio.banner("Database name has changed, renaming")
+        out = doprocess("/orabin/NTAP.renameDB --sid " + oldsid + " --newsid " + oraclesid + " --version " + version,
+                        env=myenv, printstdout=True)
+        if out['RESULT'] > 0:
+            userio.banner("Database rename failed")
+            for line in out['STDERR']:
+                userio.message("STDERR -> " + line)
+            userio.justexit()
+else:
+    if not os.path.exists("/orabin/admin/" + oraclesid + "/adump"):
+        userio.message("Creating audit directory at /orabin/admin/" + oraclesid + "/adump", prenewline=True)
+        os.makedirs("/orabin/admin/" + oraclesid + "/adump")
+
+    dbconfig.append(["/logs/" + oraclesid + "/dbconfig/spfile" + oraclesid + ".ora", oraclehome + "/dbs/spfile" + oraclesid + ".ora"])
+    dbconfig.append(["/logs/" + oraclesid + "/dbconfig/orapw" + oraclesid, oraclehome + "/dbs/orapw" + oraclesid])
+    dbconfig.append(['/logs/' + oraclesid + '/dbconfig/listener.ora', oraclehome + '/network/admin/listener.ora'])
+    dbconfig.append(['/logs/' + oraclesid + '/dbconfig/sqlnet.ora', oraclehome + '/network/admin/sqlnet.ora'])
+    dbconfig.append(['/logs/' + oraclesid + '/dbconfig/tnsnames.ora', oraclehome + '/network/admin/tnsnames.ora'])
+
+    for file, symlink in dbconfig:
+        if os.path.isfile(symlink) and not os.path.islink(symlink):
+            userio.message("Discovered file instead of symlink at " + symlink, prenewline=True)
+            userio.message('Removing file at ' + symlink)
+            os.remove(symlink)
+        elif not os.path.islink(symlink):
+            userio.message('Linking ' + file + ' to ' + symlink, prenewline=True)
+            os.symlink(file, symlink)
+
+    userio.message("Configuring /etc/oratab")
+    try:
+        oratabfh = open('/etc/oratab', 'w').write(oraclesid + ":" + oraclehome + ":N\n")
+    except Exception as e:
+        userio.warn(e)
+        userio.fail("Unable to configure /etc/oratab with current SID and ORACLE_HOME")
+
+    os.system("lsnrctl start")
+
+    userio.message("Starting database", prenewline=True)
+    out = dosqlplus(oraclesid, ['startup mount;',
+                                'recover automatic;',
+                                'alter database open;'],
+                    home=oraclehome, base=oraclebase, printstdout=True)
+    for line in out['STDOUT']:
+        userio.message("SQLPLUS STDOUT:" + line)
+    for line in out['STDERR']:
+        userio.message("SQLPLUS STDERR:" + line)
+    if out['ERRORFLAG']:
+        userio.banner(["Unexpected SQLPLUS output", 'Database may not be running correctly'])
+    elif out['RESULT'] > 0:
+        userio.banner("SQLPLUS command failed")
+
+out = dosqlplus(oraclesid, 'select open_mode from v$database;', home=oraclehome, base=oraclebase)
+if out['STDOUT'][-1] == 'READ WRITE':
+    userio.banner("Database is open for read-write")
+else:
+    userio.banner("Unable to verify database is open for read-write")
+userio.banner("Monitoring " + oraclesid + " alert log")
+
+if spin:
+    out = doprocess("ping localhost", printstdout=True)
+else:
+    out = doprocess("tail -f /orabin/diag/rdbms/" + oraclesid.lower() + "/" + oraclesid + "/trace/alert_" + oraclesid + ".log", printstdout=True)

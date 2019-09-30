@@ -1,0 +1,87 @@
+###########################################################################
+# (c) 2019 NetApp Inc. (NetApp), All Rights Reserved
+#
+# NetApp disclaims all warranties, excepting NetApp shall provide
+# support of unmodified software pursuant to a valid, separate,
+# purchased support agreement.  No distribution or modification of
+# this software is permitted by NetApp, except under separate
+# written agreement, which may be withheld at NetApp's sole
+# discretion.
+#
+# THIS SOFTWARE IS PROVIDED BY NETAPP "AS IS" AND ANY EXPRESS OR
+# IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+# WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+# ARE DISCLAIMED. IN NO EVENT SHALL NETAPP BE LIABLE FOR ANY DIRECT,
+# INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+# (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+# SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
+# HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT,
+# STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+# ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED
+# OF THE POSSIBILITY OF SUCH DAMAGE.
+#
+# Created by Jeffrey Steiner, jfs@netapp.com
+#
+###########################################################################
+
+FROM oraclelinux:7-slim
+
+MAINTAINER Jeffrey Steiner <jeffrey.steiner@netapp.com>
+
+ENV ORACLE_BASE=/orabin \
+   ORACLE_HOME=/orabin/product/11.2.0.4/dbhome_1
+
+ENV PATH=$ORACLE_HOME/bin:$ORACLE_HOME/OPatch/:/usr/sbin:$PATH \
+   LD_LIBRARY_PATH=$ORACLE_HOME/lib:/usr/lib \
+   CLASSPATH=$ORACLE_HOME/jlib:$ORACLE_HOME/rdbms/jlib
+
+COPY 11.2.0.4-1.zip 11.2.0.4-2.zip /orabin/install/ 
+COPY NTAP.install.11.2.0.4.rsp /orabin/install/NTAP.install.rsp
+COPY NTAP.dbc.11.2.0.4 /orabin/NTAP.dbc
+COPY NTAP.init NTAP.renameDB NTAP.dbca.rsp.tmpl NTAP.startDB NTAP.createDB NTAP.setPassword /orabin/
+COPY NTAPlib/* /orabin/NTAPlib/
+
+RUN chmod ug+x /orabin/NTAP.setPassword && \
+   chmod ug+x /orabin/NTAP.init && \
+   chmod ug+x /orabin/NTAP.startDB && \
+   chmod ug+x /orabin/NTAP.createDB && \
+   chmod ug+x /orabin/NTAP.renameDB && \
+   yum -y install oracle-rdbms-server-11gR2-preinstall.x86_64 unzip wget tar openssl && \
+   yum -y install openssh-server && \
+   yum -y install vim  && \
+   yum clean all && \
+   echo oracle:oracle | chpasswd && \
+   chown -R oracle:dba /orabin
+
+USER oracle
+RUN cd /orabin/install       && \
+	unzip /orabin/install/11.2.0.4-1.zip && \
+	unzip /orabin/install/11.2.0.4-2.zip && \
+	/orabin/install/database/runInstaller -silent -force -waitforcompletion -responsefile /orabin/install/NTAP.install.rsp -ignoresysprereqs -ignoreprereq && \
+	ln -s /orabin/NTAP.setPassword /home/oracle/ && \
+	echo "DEDICATED_THROUGH_BROKER_LISTENER=ON"  >> $ORACLE_HOME/network/admin/listener.ora && \
+	echo "DIAG_ADR_ENABLED = off"  >> $ORACLE_HOME/network/admin/listener.ora;
+
+USER root
+RUN /orabin/oraInventory/orainstRoot.sh && \
+    $ORACLE_HOME/root.sh && \
+	 rm -rf /orabin/install && \
+	 mkdir /oradata && \
+	 mkdir /logs && \
+     chmod ug+x /orabin/NTAPlib/* && \
+     chown oracle:dba /orabin/NTAPlib && \
+	 chown oracle:dba /oradata && \
+	 chown oracle:dba /logs 
+
+USER oracle
+RUN mkdir /home/oracle/.ssh && \
+    chmod 700 /home/oracle/.ssh && \
+    ssh-keygen -t rsa -f /home/oracle/.ssh/ssh_host_rsa_key 
+COPY NTAP.oracle.sshd_config /home/oracle/.ssh/sshd_config 
+COPY NTAP.authorized_keys /home/oracle/.ssh/authorized_keys
+
+WORKDIR /home/oracle 
+
+EXPOSE 1521 2022 
+   
+CMD exec /orabin/NTAP.init

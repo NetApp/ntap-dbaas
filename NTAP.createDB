@@ -1,0 +1,252 @@
+#!/usr/bin/python
+###########################################################################
+# (c) 2019 NetApp Inc. (NetApp), All Rights Reserved
+#
+# NetApp disclaims all warranties, excepting NetApp shall provide
+# support of unmodified software pursuant to a valid, separate,
+# purchased support agreement.  No distribution or modification of
+# this software is permitted by NetApp, except under separate
+# written agreement, which may be withheld at NetApp's sole
+# discretion.
+#
+# THIS SOFTWARE IS PROVIDED BY NETAPP "AS IS" AND ANY EXPRESS OR
+# IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+# WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+# ARE DISCLAIMED. IN NO EVENT SHALL NETAPP BE LIABLE FOR ANY DIRECT,
+# INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+# (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+# SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
+# HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT,
+# STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+# ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED
+# OF THE POSSIBILITY OF SUCH DAMAGE.
+#
+# Created by Jeffrey Steiner, jfs@netapp.com
+#
+###########################################################################
+
+###########################################################################
+#
+# This script is used with the ntap-dbaas container framework, but also
+# works as a standalone script. The main requirement is to pass the
+# required arguments such as the version and Oracle SID to the script so
+# it can complete database creation using dbca.
+#
+# It's currently hard-coded to call dbca using a template located at
+# $ORACLE_HOME/assistants/dbca/templates/NTAP.dbc
+#
+###########################################################################
+
+import sys
+import os
+import signal
+sys.path.append(sys.path[0] + "/NTAPlib")
+from dosqlplus import dosqlplus as dosqlplus
+from doprocess import doprocess as doprocess
+import userio
+import getopt
+
+
+def printusageanddie():
+    sys.stdout.write("createDB --sid [Oracle SID]\n")
+    sys.stdout.write("        --pdb [Oracle PDB, if >=12.2.0.1]\n")
+    sys.stdout.write("        --password [password to assign at DB creation time]\n")
+    sys.stdout.write("        --version [Oracle version, such as 12.2.0.1]\n")
+    sys.stdout.write("        --charset [Character set for new databases]\n")
+    sys.stdout.write("        --noarchive [disable archivelogging]\n")
+    sys.exit(1)
+
+
+pdbmode = False
+oraclebase = '/orabin'
+dbconfig = []
+myenv = {}
+version = None
+oraclesid = None
+oraclepdb = ''
+oraclepwd = 'oracle'
+knownversions = ['12.2.0.1', '12.1.0.2', '11.2.0.4']
+charset = 'US7ASCII'
+noarchive = False
+
+try:
+    options, args = getopt.getopt(sys.argv[1:], '', ["sid=", "pdb=", "password=", "version=", "charset="])
+except getopt.GetoptError as e:
+    userio.fail(str(e))
+
+for o, a in options:
+    if o == '--sid':
+        oraclesid = a
+    elif o == '--pdb':
+        oraclepdb = a
+        pdbmode = True
+    elif o == '--password':
+        oraclepwd = a
+    elif o == '--version':
+        version = a
+    elif o == '--charset':
+        charset = a
+
+if oraclesid is None or version is None:
+    printusageanddie()
+
+if pdbmode and oraclesid == oraclepdb:
+    userio.fail("PDB name cannot be the same as the Oracle SID")
+
+if version not in knownversions:
+    userio.fail("Oracle version " + version + " not recognized")
+
+if os.path.exists("/etc/oratab"):
+    count = doprocess("grep -c ^" + oraclesid + ": /etc/oratab")['STDOUT'][0]
+    if int(count) == 1:
+        userio.fail("Found SID " + oraclesid + " in /etc/oratab")
+
+fields = map(int, version.split('.'))
+if fields[0] >= 12 and fields[1] >= 2 and oraclepdb == '':
+    userio.fail("PDB name required for >=12.2.0.1")
+
+userio.message("ORACLE_SID is " + oraclesid, prenewline=True)
+
+
+oraclehome = os.path.join(oraclebase, 'product', version, 'dbhome_1')
+userio.message("ORACLE_HOME is " + oraclehome, prenewline=True)
+
+myenv = {'PATH': oraclehome + "/bin", 'ORACLE_HOME': oraclehome, 'ORACLE_SID': oraclesid, 'ORACLE_BASE': oraclebase}
+if pdbmode:
+    myenv['ORACLE_PDB'] = oraclepdb
+    userio.message("ORACLE_PDB is " + oraclepdb, prenewline=True)
+
+if not os.path.exists("/orabin/admin/" + oraclesid + "/adump"):
+    userio.message("Creating audit directory at /orabin/admin/" + oraclesid + "/adump", prenewline=True)
+    os.makedirs("/orabin/admin/" + oraclesid + "/adump")
+
+if not os.path.exists(os.path.join(oraclehome, "assistants/dbca/templates/NTAP.dbc")):
+    os.rename("/orabin/NTAP.dbc", os.path.join(oraclehome, 'assistants/dbca/templates/NTAP.dbc'))
+
+if not os.path.exists("/oradata/" + oraclesid):
+    userio.message("Creating datafile directory at /oradata/" + oraclesid, prenewline=True)
+elif len(os.listdir("/oradata/" + oraclesid)) > 0:
+    os.makedirs("/oradata/" + oraclesid)
+    userio.fail("Datafile directory already exists at /oradata/" + oraclesid)
+
+if not os.path.exists("/logs/" + oraclesid):
+    userio.message("Creating log directory at /logs/" + oraclesid, prenewline=True)
+    os.makedirs("/logs/" + oraclesid)
+elif len(os.listdir("/logs/" + oraclesid)):
+    userio.fail("Log directory already exists at /oradata/" + oraclesid)
+
+os.mkdir("/logs/" + oraclesid + "/dbconfig")
+os.mkdir("/logs/" + oraclesid + "/redo")
+os.mkdir("/logs/" + oraclesid + "/arch")
+os.mkdir("/logs/" + oraclesid + "/ctrl")
+os.mkdir("/logs/" + oraclesid + "/ssh")
+os.system("cp /home/oracle/.ssh/authorized_keys /logs/" + oraclesid + "/ssh/authorized_keys")
+
+userio.message("Creating DBCA template file", prenewline=True)
+replacements = {'###ORACLE_SID###': oraclesid, '###ORACLE_PDB###': oraclepdb, '###ORACLE_PWD###': oraclepwd, '###ORACLE_CHARACTERSET###': charset}
+lines = open("/orabin/NTAP.dbca.rsp.tmpl").read()
+for key in replacements.keys():
+    if replacements[key] is not None:
+        lines = lines.replace(key, replacements[key])
+rspfh = open("/orabin/NTAP.dbca.rsp", 'w')
+rspfh.write(lines)
+rspfh.close()
+
+psoutput = doprocess("ps -eo cmd")
+for line in psoutput:
+    if 'tnslsnr' in line:
+        doprocess("lsnrctl stop", env=myenv)
+userio.message("Creating and linking listener.ora file", prenewline=True)
+fileh = open("/logs/" + oraclesid + "/dbconfig/listener.ora", 'w')
+fileh.write("LISTENER =\n")
+fileh.write("(DESCRIPTION_LIST =\n")
+fileh.write("  (DESCRIPTION =\n")
+fileh.write("    (ADDRESS = (PROTOCOL = IPC)(KEY = EXTPROC1))\n")
+fileh.write("    (ADDRESS = (PROTOCOL = TCP)(HOST = 0.0.0.0)(PORT = 1521))\n")
+fileh.write("  )\n")
+fileh.write(")\n")
+fileh.close()
+if os.path.exists(oraclehome + "/network/admin/listener.ora") or os.path.islink(oraclehome + "/network/admin/listener.ora"):
+    os.remove(oraclehome + "/network/admin/listener.ora")
+os.symlink("/logs/" + oraclesid + "/dbconfig/listener.ora", oraclehome + "/network/admin/listener.ora")
+
+userio.message("Creating and linking sqlnet.ora file", prenewline=True)
+sqlnetfh = open('/logs/' + oraclesid + '/dbconfig/sqlnet.ora', 'w')
+sqlnetfh.write("NAME.DIRECTORY_PATH= {TNSNAMES, EZCONNECT, HOSTNAME}\n")
+sqlnetfh.close()
+if os.path.exists(oraclehome + "/network/admin/sqlnet.ora") or os.path.islink(oraclehome + "/network/admin/sqlnet.ora"):
+    os.remove(oraclehome + "/network/admin/sqlnet.ora")
+os.symlink("/logs/" + oraclesid + "/dbconfig/sqlnet.ora", oraclehome + "/network/admin/sqlnet.ora")
+
+userio.message("Creating and linking tnsnames file", prenewline=True)
+if pdbmode:
+    svcname = oraclepdb
+else:
+    svcname = oraclesid
+fileh = open("/logs/" + oraclesid + "/dbconfig/tnsnames.ora", 'w')
+fileh.write(oraclesid + "=localhost:1521/" + oraclesid + "\n")
+fileh.write(svcname + "=\n")
+fileh.write("(DESCRIPTION =\n")
+fileh.write("  (ADDRESS = (PROTOCOL = TCP)(HOST = 0.0.0.0)(PORT = 1521))\n")
+fileh.write("  (CONNECT_DATA =\n")
+fileh.write("    (SERVER = DEDICATED)\n")
+fileh.write("    (SERVICE_NAME = " + svcname + "\n")
+fileh.write("  )\n")
+fileh.write("  )\n")
+fileh.write(")\n")
+fileh.close()
+if os.path.isfile(oraclehome + "/network/admin/tnsnames.ora") or os.path.islink(oraclehome + "/network/admin/tnsnames.ora"):
+    os.remove(oraclehome + "/network/admin/tnsnames.ora")
+os.symlink("/logs/" + oraclesid + "/dbconfig/tnsnames.ora", oraclehome + "/network/admin/tnsnames.ora")
+
+userio.message("Calling dbca to create database...", prenewline=True)
+out = doprocess("dbca -silent -createDatabase -honorControlFileInitParam -responseFile " + oraclebase + "/NTAP.dbca.rsp", env=myenv, printstdout=True)
+
+if out['RESULT'] > 0:
+    userio.banner("Errors encounted running dbca")
+    for line in out['STDOUT']:
+        userio.message("STDOUT-> " + line)
+    for line in out['STDERR']:
+        userio.message("STDERR-> " + line)
+    if os.path.isfile("/orabin/cfgtoollogs/dbca/" + oraclesid + "/" + oraclesid + ".log"):
+        lines = open("/orabin/cfgtoollogs/dbca/" + oraclesid + "/" + oraclesid + ".log", 'r').read().splitlines()
+        for line in lines:
+            print "cfgtoollogs1 -> " + line
+    if os.path.isfile("/orabin/cfgtoollogs/dbca/" + oraclesid + ".log"):
+        lines = open("/orabin/cfgtoollogs/dbca/" + oraclesid + ".log", 'r').read().splitlines()
+        for line in lines:
+            print "cfgtoollogs2 -> " + line
+    userio.justexit()
+
+if pdbmode:
+    commandblock = []
+    userio.message("Setting PDB to open automatically", prenewline=True)
+    commandblock.append("alter pluggable database " + oraclepdb + " save state;")
+    out = dosqlplus(oraclesid, commandblock, home=oraclehome, base=oraclebase, printstdout=True)
+
+userio.message("Updating /etc/oratab")
+oratabfh = open('/etc/oratab', 'a').write(oraclesid + ":" + oraclehome + ":N\n")
+
+userio.message("Relocating Oracle password file")
+newpwfile = "/logs/" + oraclesid + "/dbconfig/orapw" + oraclesid
+newpwlink = oraclehome + "/dbs/orapw" + oraclesid
+out = doprocess("mv " + newpwlink + " " + newpwfile)
+os.symlink(newpwfile, newpwlink)
+
+userio.message("Relocating spfile")
+newspfile = "/logs/" + oraclesid + "/dbconfig/spfile" + oraclesid + ".ora"
+newsplink = oraclehome + "/dbs/spfile" + oraclesid + ".ora"
+out = doprocess("mv " + newsplink + " " + newspfile)
+os.symlink(newspfile, newsplink)
+
+if noarchive:
+    userio.message("Archive logging disabled", prenewline=True)
+else:
+    commandblock = []
+    userio.message("Enabling log archival to /logs/" + oraclesid + "/arch", prenewline=True)
+    commandblock.append("shutdown immediate;")
+    commandblock.append("startup mount")
+    commandblock.append("alter system set log_archive_dest='/logs/" + oraclesid + "/arch' scope=spfile;")
+    commandblock.append("alter database archivelog;")
+    commandblock.append("alter database open;")
+    out = dosqlplus(oraclesid, commandblock, home=oraclehome, base=oraclebase, printstdout=True)

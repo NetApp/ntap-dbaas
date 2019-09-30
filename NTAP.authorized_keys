@@ -1,0 +1,3 @@
+# This file is a placeholder for an authorized key file. This will allow a user to ssh into the container from the outside world if required for maintenance.
+# Place your own public key here.
+ssh-rsa [long string of characters and numbers] user@hostname
